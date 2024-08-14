@@ -20,12 +20,12 @@ export class TemplateService {
       useTabs: settings.useTabs,
     };
 
-    const templateSource = this.prettierModule.format(
+    const templateSource = await this.prettierModule.format(
       JSON.stringify(settings, null, 2),
       formatterOptions
     );
 
-    this.loggingService.logInfo(`Writing .prettierrc to '${outputPath}'`);
+    this.loggingService.logInfo(`Writing .prettierrc to ${outputPath}`);
     await workspace.fs.writeFile(
       outputPath,
       new TextEncoder().encode(templateSource)

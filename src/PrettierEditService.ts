@@ -14,6 +14,7 @@ import { getParserFromLanguageId } from "./languageFilters";
 import { LoggingService } from "./LoggingService";
 import { RESTART_TO_ENABLE } from "./message";
 import { PrettierEditProvider } from "./PrettierEditProvider";
+import { PrettierInstance } from "./PrettierInstance";
 import { FormatterStatus, StatusBar } from "./StatusBar";
 import {
   ExtensionFormattingOptions,
@@ -22,9 +23,10 @@ import {
   PrettierFileInfoResult,
   PrettierModule,
   PrettierOptions,
+  PrettierPlugin,
   RangeFormattingOptions,
 } from "./types";
-import { getConfig } from "./util";
+import { getConfig, isAboveV3 } from "./util";
 
 interface ISelectors {
   rangeLanguageSelector: ReadonlyArray<DocumentFilter>;
@@ -43,9 +45,11 @@ const PRETTIER_CONFIG_FILES = [
   ".prettierrc.toml",
   ".prettierrc.js",
   ".prettierrc.cjs",
+  ".prettierrc.mjs",
   "package.json",
   "prettier.config.js",
   "prettier.config.cjs",
+  "prettier.config.mjs",
   ".editorconfig",
 ];
 
@@ -94,10 +98,10 @@ export default class PrettierEditService implements Disposable {
     prettierConfigWatcher.onDidDelete(this.prettierConfigChanged);
 
     const textEditorChange = window.onDidChangeActiveTextEditor(
-      this.handleActiveTextEditorChanged
+      this.handleActiveTextEditorChangedSync
     );
 
-    this.handleActiveTextEditorChanged(window.activeTextEditor);
+    this.handleActiveTextEditorChangedSync(window.activeTextEditor);
 
     return [
       packageWatcher,
@@ -136,7 +140,7 @@ export default class PrettierEditService implements Disposable {
 
   private prettierConfigChanged = async (uri: Uri) => this.resetFormatters(uri);
 
-  private resetFormatters = async (uri?: Uri) => {
+  private resetFormatters = (uri?: Uri) => {
     if (uri) {
       const workspaceFolder = workspace.getWorkspaceFolder(uri);
       this.registeredWorkspaces.delete(workspaceFolder?.uri.fsPath ?? "global");
@@ -145,6 +149,14 @@ export default class PrettierEditService implements Disposable {
       this.registeredWorkspaces.clear();
     }
     this.statusBar.update(FormatterStatus.Ready);
+  };
+
+  private handleActiveTextEditorChangedSync = (
+    textEditor: TextEditor | undefined
+  ) => {
+    this.handleActiveTextEditorChanged(textEditor).catch((err) => {
+      this.loggingService.logError("Error handling text editor change", err);
+    });
   };
 
   private handleActiveTextEditorChanged = async (
@@ -187,8 +199,13 @@ export default class PrettierEditService implements Disposable {
 
     const selectors = await this.getSelectors(
       prettierInstance,
+      document.uri,
       workspaceFolder.uri
     );
+
+    this.statusBar.updateConfig({
+      selector: selectors.languageSelector,
+    });
 
     if (!isRegistered) {
       this.registerDocumentFormatEditorProviders(selectors);
@@ -244,10 +261,37 @@ export default class PrettierEditService implements Disposable {
    * Build formatter selectors
    */
   private getSelectors = async (
-    prettierInstance: PrettierModule,
-    uri?: Uri
+    prettierInstance: PrettierModule | PrettierInstance,
+    documentUri?: Uri,
+    workspaceFolderUri?: Uri
   ): Promise<ISelectors> => {
-    const { languages } = prettierInstance.getSupportInfo();
+    const plugins: (string | PrettierPlugin)[] = [];
+
+    // Prettier v3 does not load plugins automatically
+    // So need to resolve config to get plugins info.
+    if (
+      documentUri &&
+      "resolveConfig" in prettierInstance &&
+      isAboveV3(prettierInstance.version)
+    ) {
+      const resolvedConfig = await this.moduleResolver.resolveConfig(
+        prettierInstance,
+        documentUri,
+        documentUri.fsPath,
+        getConfig(documentUri)
+      );
+      if (resolvedConfig === "error") {
+        this.statusBar.update(FormatterStatus.Error);
+      } else if (resolvedConfig === "disabled") {
+        this.statusBar.update(FormatterStatus.Disabled);
+      } else if (resolvedConfig?.plugins) {
+        plugins.push(...resolvedConfig.plugins);
+      }
+    }
+
+    const { languages } = await prettierInstance.getSupportInfo({
+      plugins,
+    });
 
     languages.forEach((lang) => {
       if (lang && lang.vscodeLanguageIds) {
@@ -270,12 +314,12 @@ export default class PrettierEditService implements Disposable {
     const { documentSelectors } = getConfig();
 
     // Language selector for file extensions
-    const extensionLanguageSelector: DocumentFilter[] = uri
+    const extensionLanguageSelector: DocumentFilter[] = workspaceFolderUri
       ? this.allExtensions.length === 0
         ? []
         : [
             {
-              pattern: `${uri.fsPath}/**/*.{${this.allExtensions
+              pattern: `${workspaceFolderUri.fsPath}/**/*.{${this.allExtensions
                 .map((e) => e.substring(1))
                 .join(",")}}`,
               scheme: "file",
@@ -283,9 +327,9 @@ export default class PrettierEditService implements Disposable {
           ]
       : [];
 
-    const customLanguageSelectors: DocumentFilter[] = uri
+    const customLanguageSelectors: DocumentFilter[] = workspaceFolderUri
       ? documentSelectors.map((pattern) => ({
-          pattern: `${uri.fsPath}/${pattern}`,
+          pattern: `${workspaceFolderUri.fsPath}/${pattern}`,
           scheme: "file",
         }))
       : [];
@@ -367,7 +411,7 @@ export default class PrettierEditService implements Disposable {
 
     this.loggingService.logInfo(`Formatting ${uri}`);
 
-    const vscodeConfig = getConfig(uri);
+    const vscodeConfig = getConfig(doc);
 
     const resolvedConfig = await this.moduleResolver.getResolvedConfig(
       doc,
@@ -385,6 +429,7 @@ export default class PrettierEditService implements Disposable {
     const prettierInstance = await this.moduleResolver.getPrettierInstance(
       fileName
     );
+    this.loggingService.logInfo("PrettierInstance:", prettierInstance);
 
     if (!prettierInstance) {
       this.loggingService.logError(
@@ -411,6 +456,9 @@ export default class PrettierEditService implements Disposable {
     if (fileName) {
       fileInfo = await prettierInstance.getFileInfo(fileName, {
         ignorePath: resolvedIgnorePath,
+        plugins: resolvedConfig?.plugins?.filter(
+          (item): item is string => typeof item === "string"
+        ),
         resolveConfig: true,
         withNodeModules: vscodeConfig.withNodeModules,
       });
@@ -434,7 +482,9 @@ export default class PrettierEditService implements Disposable {
       this.loggingService.logWarning(
         `Parser not inferred, trying VS Code language.`
       );
-      const languages = prettierInstance.getSupportInfo().languages;
+      const { languages } = await prettierInstance.getSupportInfo({
+        plugins: [],
+      });
       parser = getParserFromLanguageId(languages, uri, languageId);
     }
 
@@ -457,7 +507,11 @@ export default class PrettierEditService implements Disposable {
     this.loggingService.logInfo("Prettier Options:", prettierOptions);
 
     try {
-      const formattedText = prettierInstance.format(text, prettierOptions);
+      // Since Prettier v3, `format` returns Promise.
+      const formattedText = await prettierInstance.format(
+        text,
+        prettierOptions
+      );
       this.statusBar.update(FormatterStatus.Success);
 
       return formattedText;
@@ -498,7 +552,10 @@ export default class PrettierEditService implements Disposable {
       vsOpts.tabWidth = vsCodeConfig.tabWidth;
       vsOpts.trailingComma = vsCodeConfig.trailingComma;
       vsOpts.useTabs = vsCodeConfig.useTabs;
+      vsOpts.embeddedLanguageFormatting =
+        vsCodeConfig.embeddedLanguageFormatting;
       vsOpts.vueIndentScriptAndStyle = vsCodeConfig.vueIndentScriptAndStyle;
+      vsOpts.experimentalTernaries = vsCodeConfig.experimentalTernaries;
     }
 
     this.loggingService.logInfo(

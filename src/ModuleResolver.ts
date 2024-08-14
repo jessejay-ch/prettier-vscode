@@ -23,13 +23,39 @@ import {
   PrettierResolveConfigOptions,
   PrettierVSCodeConfig,
 } from "./types";
-import { getConfig, getWorkspaceRelativePath } from "./util";
+import { getConfig, getWorkspaceRelativePath, isAboveV3 } from "./util";
+import { PrettierWorkerInstance } from "./PrettierWorkerInstance";
+import { PrettierInstance } from "./PrettierInstance";
+import { PrettierMainThreadInstance } from "./PrettierMainThreadInstance";
+import { loadNodeModule, resolveConfigPlugins } from "./ModuleLoader";
 
 const minPrettierVersion = "1.13.0";
-declare const __webpack_require__: typeof require;
-declare const __non_webpack_require__: typeof require;
 
 export type PrettierNodeModule = typeof prettier;
+
+const origFsStatSync = fs.statSync;
+const fsStatSyncWorkaround = (
+  path: fs.PathLike,
+  options: fs.StatSyncOptions,
+) => {
+  if (
+    options?.throwIfNoEntry === true ||
+    options?.throwIfNoEntry === undefined
+  ) {
+    return origFsStatSync(path, options);
+  }
+  options.throwIfNoEntry = true;
+  try {
+    return origFsStatSync(path, options);
+  } catch (error: any) {
+    if (error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+};
+// @ts-expect-error Workaround for https://github.com/prettier/prettier-vscode/issues/3020
+fs.statSync = fsStatSyncWorkaround;
 
 const globalPaths: {
   [key: string]: { cache: string | undefined; get(): string | undefined };
@@ -69,7 +95,8 @@ function globalPathGet(packageManager: PackageManagers): string | undefined {
 export class ModuleResolver implements ModuleResolverInterface {
   private findPkgCache: Map<string, string>;
   private ignorePathCache = new Map<string, string>();
-  private path2Module = new Map<string, PrettierNodeModule>();
+
+  private path2Module = new Map<string, PrettierInstance>();
 
   constructor(private loggingService: LoggingService) {
     this.findPkgCache = new Map();
@@ -79,20 +106,64 @@ export class ModuleResolver implements ModuleResolverInterface {
     return prettier;
   }
 
+  private loadPrettierVersionFromPackageJson(modulePath: string): string {
+    let cwd = "";
+    try {
+      fs.readdirSync(modulePath); // checking if dir with readdir will handle directories and symlinks
+      cwd = modulePath;
+    } catch {
+      cwd = path.dirname(modulePath);
+    }
+    const packageJsonPath = findUp.sync(
+      (dir) => {
+        const pkgFilePath = path.join(dir, "package.json");
+        if (fs.existsSync(pkgFilePath)) {
+          return pkgFilePath;
+        }
+      },
+      { cwd }
+    );
+
+    if (!packageJsonPath) {
+      throw new Error("Cannot find Prettier package.json");
+    }
+
+    const prettierPkgJson = loadNodeModule(packageJsonPath);
+
+    let version: string | null = null;
+
+    if (
+      typeof prettierPkgJson === "object" &&
+      prettierPkgJson !== null &&
+      "version" in prettierPkgJson &&
+      // @ts-expect-error checked
+      typeof prettierPkgJson.version === "string"
+    ) {
+      // @ts-expect-error checked
+      version = prettierPkgJson.version;
+    }
+
+    if (!version) {
+      throw new Error("Cannot load Prettier version from package.json");
+    }
+
+    return version;
+  }
+
   /**
    * Returns an instance of the prettier module.
    * @param fileName The path of the file to use as the starting point. If none provided, the bundled prettier will be used.
    */
   public async getPrettierInstance(
-    fileName: string
-  ): Promise<PrettierNodeModule | undefined> {
+    fileName: string,
+  ): Promise<PrettierNodeModule | PrettierInstance | undefined> {
     if (!workspace.isTrusted) {
       this.loggingService.logDebug(UNTRUSTED_WORKSPACE_USING_BUNDLED_PRETTIER);
       return prettier;
     }
 
     const { prettierPath, resolveGlobalModules } = getConfig(
-      Uri.file(fileName)
+      Uri.file(fileName),
     );
 
     // Look for local module
@@ -117,7 +188,7 @@ export class ModuleResolver implements ModuleResolverInterface {
       this.loggingService.logInfo(
         `Attempted to determine module path from ${
           modulePath || moduleDirectory || "package.json"
-        }`
+        }`,
       );
       this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
 
@@ -140,7 +211,7 @@ export class ModuleResolver implements ModuleResolverInterface {
       if (resolvedGlobalPackageManagerPath) {
         const globalModulePath = path.join(
           resolvedGlobalPackageManagerPath,
-          "prettier"
+          "prettier",
         );
         if (fs.existsSync(globalModulePath)) {
           modulePath = globalModulePath;
@@ -148,18 +219,26 @@ export class ModuleResolver implements ModuleResolverInterface {
       }
     }
 
-    let moduleInstance: PrettierNodeModule | undefined = undefined;
+    let moduleInstance: PrettierInstance | undefined = undefined;
+
     if (modulePath !== undefined) {
-      this.loggingService.logDebug(
-        `Local prettier module path: '${modulePath}'`
-      );
+      this.loggingService.logDebug(`Local prettier module path: ${modulePath}`);
       // First check module cache
       moduleInstance = this.path2Module.get(modulePath);
       if (moduleInstance) {
         return moduleInstance;
       } else {
         try {
-          moduleInstance = this.loadNodeModule<PrettierNodeModule>(modulePath);
+          const prettierVersion =
+            this.loadPrettierVersionFromPackageJson(modulePath);
+
+          const isAboveVersion3 = isAboveV3(prettierVersion);
+
+          if (isAboveVersion3) {
+            moduleInstance = new PrettierWorkerInstance(modulePath);
+          } else {
+            moduleInstance = new PrettierMainThreadInstance(modulePath);
+          }
           if (moduleInstance) {
             this.path2Module.set(modulePath, moduleInstance);
           }
@@ -167,7 +246,7 @@ export class ModuleResolver implements ModuleResolverInterface {
           this.loggingService.logInfo(
             `Attempted to load Prettier module from ${
               modulePath || "package.json"
-            }`
+            }`,
           );
           this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
 
@@ -178,31 +257,23 @@ export class ModuleResolver implements ModuleResolverInterface {
     }
 
     if (moduleInstance) {
-      // If the instance is missing `format`, it's probably
-      // not an instance of Prettier
-      const isPrettierInstance = !!moduleInstance.format;
-      const isValidVersion =
-        moduleInstance.version &&
-        !!moduleInstance.getSupportInfo &&
-        !!moduleInstance.getFileInfo &&
-        !!moduleInstance.resolveConfig &&
-        semver.gte(moduleInstance.version, minPrettierVersion);
+      const version = await moduleInstance.import();
 
-      if (!isPrettierInstance && prettierPath) {
+      if (!version && prettierPath) {
         this.loggingService.logError(INVALID_PRETTIER_PATH_MESSAGE);
         return undefined;
       }
 
+      const isValidVersion = version && semver.gte(version, minPrettierVersion);
+
       if (!isValidVersion) {
         this.loggingService.logInfo(
-          `Attempted to load Prettier module from ${modulePath}`
+          `Attempted to load Prettier module from ${modulePath}`,
         );
         this.loggingService.logError(OUTDATED_PRETTIER_VERSION_MESSAGE);
         return undefined;
       } else {
-        this.loggingService.logDebug(
-          `Using prettier version ${moduleInstance.version}`
-        );
+        this.loggingService.logDebug(`Using prettier version ${version}`);
       }
       return moduleInstance;
     } else {
@@ -213,7 +284,7 @@ export class ModuleResolver implements ModuleResolverInterface {
 
   public async getResolvedIgnorePath(
     fileName: string,
-    ignorePath: string
+    ignorePath: string,
   ): Promise<string | undefined> {
     const cacheKey = `${fileName}:${ignorePath}`;
     // cache resolvedIgnorePath because resolving it checks the file system
@@ -243,7 +314,7 @@ export class ModuleResolver implements ModuleResolverInterface {
             // https://stackoverflow.com/questions/17699599/node-js-check-if-file-exists#comment121041700_57708635
             await fs.promises.stat(p).then(
               () => true,
-              () => false
+              () => false,
             )
           ) {
             resolvedIgnorePath = p;
@@ -258,23 +329,52 @@ export class ModuleResolver implements ModuleResolverInterface {
     return resolvedIgnorePath;
   }
 
-  public async getResolvedConfig(
-    { fileName, uri }: TextDocument,
-    vscodeConfig: PrettierVSCodeConfig
+  private adjustFileNameForPrettierVersion3_1_1(
+    prettierInstance: { version: string | null },
+    fileName: string,
+  ) {
+    if (!prettierInstance.version) {
+      return fileName;
+    }
+    // Avoid https://github.com/prettier/prettier/pull/15363
+    const isGte3_1_1 = semver.gte(prettierInstance.version, "3.1.1");
+    if (isGte3_1_1) {
+      return path.join(fileName, "noop.js");
+    }
+    return fileName;
+  }
+
+  public async resolveConfig(
+    prettierInstance: {
+      version: string | null;
+      resolveConfigFile(filePath?: string): Promise<string | null>;
+      resolveConfig(
+        fileName: string,
+        options?: prettier.ResolveConfigOptions,
+      ): Promise<PrettierOptions | null>;
+    },
+    uri: Uri,
+    fileName: string,
+    vscodeConfig: PrettierVSCodeConfig,
   ): Promise<"error" | "disabled" | PrettierOptions | null> {
     const isVirtual = uri.scheme !== "file" && uri.scheme !== "vscode-userdata";
 
     let configPath: string | undefined;
     try {
       if (!isVirtual) {
-        configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
+        configPath =
+          (await prettierInstance.resolveConfigFile(
+            this.adjustFileNameForPrettierVersion3_1_1(
+              prettierInstance,
+              fileName,
+            ),
+          )) ?? undefined;
       }
     } catch (error) {
       this.loggingService.logError(
         `Error resolving prettier configuration for ${fileName}`,
-        error
+        error,
       );
-
       return "error";
     }
 
@@ -291,11 +391,11 @@ export class ModuleResolver implements ModuleResolverInterface {
     try {
       resolvedConfig = isVirtual
         ? null
-        : await prettier.resolveConfig(fileName, resolveConfigOptions);
+        : await prettierInstance.resolveConfig(fileName, resolveConfigOptions);
     } catch (error) {
       this.loggingService.logError(
         "Invalid prettier configuration file detected.",
-        error
+        error,
       );
       this.loggingService.logError(INVALID_PRETTIER_CONFIG);
 
@@ -303,20 +403,43 @@ export class ModuleResolver implements ModuleResolverInterface {
     }
     if (resolveConfigOptions.config) {
       this.loggingService.logInfo(
-        `Using config file at '${resolveConfigOptions.config}'`
+        `Using config file at ${resolveConfigOptions.config}`,
       );
     }
 
     if (resolvedConfig) {
-      resolvedConfig = this.resolveConfigPlugins(resolvedConfig, fileName);
+      resolvedConfig = resolveConfigPlugins(resolvedConfig, fileName);
     }
 
-    if (!isVirtual && !resolvedConfig && vscodeConfig.requireConfig) {
+    if (
+      !isVirtual &&
+      !vscodeConfig.configPath &&
+      !configPath &&
+      vscodeConfig.requireConfig
+    ) {
       this.loggingService.logInfo(
-        "Require config set to true and no config present. Skipping file."
+        "Require config set to true and no config present. Skipping file.",
       );
       return "disabled";
     }
+
+    return resolvedConfig;
+  }
+
+  public async getResolvedConfig(
+    { fileName, uri }: TextDocument,
+    vscodeConfig: PrettierVSCodeConfig,
+  ): Promise<"error" | "disabled" | PrettierOptions | null> {
+    const prettierInstance: typeof prettier | PrettierInstance =
+      (await this.getPrettierInstance(fileName)) || prettier;
+
+    const resolvedConfig = await this.resolveConfig(
+      prettierInstance,
+      uri,
+      fileName,
+      vscodeConfig,
+    );
+
     return resolvedConfig;
   }
 
@@ -324,71 +447,16 @@ export class ModuleResolver implements ModuleResolverInterface {
    * Clears the module and config cache
    */
   public async dispose() {
-    prettier.clearConfigCache();
+    await prettier.clearConfigCache();
     this.path2Module.forEach((module) => {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
         module.clearConfigCache();
       } catch (error) {
         this.loggingService.logError("Error clearing module cache.", error);
       }
     });
     this.path2Module.clear();
-  }
-
-  private get nodeModuleLoader() {
-    return typeof __webpack_require__ === "function"
-      ? __non_webpack_require__
-      : require;
-  }
-
-  // Source: https://github.com/microsoft/vscode-eslint/blob/master/server/src/eslintServer.ts
-  private loadNodeModule<T>(moduleName: string): T | undefined {
-    try {
-      return this.nodeModuleLoader(moduleName);
-    } catch (error) {
-      this.loggingService.logError(
-        `Error loading node module '${moduleName}'`,
-        error
-      );
-    }
-    return undefined;
-  }
-
-  private resolveNodeModule(moduleName: string, options?: { paths: string[] }) {
-    try {
-      return this.nodeModuleLoader.resolve(moduleName, options);
-    } catch (error) {
-      this.loggingService.logError(
-        `Error resolve node module '${moduleName}'`,
-        error
-      );
-    }
-    return undefined;
-  }
-
-  /**
-   * Resolve plugin package path for symlink structure dirs
-   * See https://github.com/prettier/prettier/issues/8056
-   */
-  private resolveConfigPlugins(
-    config: PrettierOptions,
-    fileName: string
-  ): PrettierOptions {
-    if (config?.plugins?.length) {
-      config.plugins = config.plugins.map((plugin) => {
-        if (
-          typeof plugin === "string" &&
-          !plugin.startsWith(".") &&
-          !path.isAbsolute(plugin)
-        ) {
-          return (
-            this.resolveNodeModule(plugin, { paths: [fileName] }) || plugin
-          );
-        }
-        return plugin;
-      });
-    }
-    return config;
   }
 
   private isInternalTestRoot(dir: string): boolean {
@@ -432,7 +500,7 @@ export class ModuleResolver implements ModuleResolverInterface {
           let packageJson;
           try {
             packageJson = JSON.parse(
-              fs.readFileSync(path.join(dir, "package.json"), "utf8")
+              fs.readFileSync(path.join(dir, "package.json"), "utf8"),
             );
           } catch (e) {
             // Swallow, if we can't read it we don't want to resolve based on it
@@ -452,7 +520,7 @@ export class ModuleResolver implements ModuleResolverInterface {
           return findUp.stop;
         }
       },
-      { cwd: finalPath, type: "directory" }
+      { cwd: finalPath, type: "directory" },
     );
 
     if (packageJsonResDir) {
@@ -472,7 +540,7 @@ export class ModuleResolver implements ModuleResolverInterface {
           return findUp.stop;
         }
       },
-      { cwd: finalPath, type: "directory" }
+      { cwd: finalPath, type: "directory" },
     );
 
     if (nodeModulesResDir) {

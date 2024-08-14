@@ -4,6 +4,92 @@ All notable changes to the "prettier-vscode" extension will be documented in thi
 
 <!-- Check [Keep a Changelog](https://keepachangelog.com/) for recommendations on how to structure this file. -->
 
+## [11.0.0]
+
+- [BREAKING CHANGE] Prevent `.editorconfig` from satisfying the `requireConfig` setting (#2708) - Thanks to [@redoPop](https://github.com/redoPop)
+- Fix issue where formatting multiple files in a workspace with multiple instances of Prettier could result in files being overwritten with the contents of other files (#3423, #3040) - Thanks to [@bob-difronzo](https://github.com/bob-difronzo)
+- Added Language Status Item for Prettier
+- Add support for `experimentalTernaries` option
+
+## [10.5.0]
+
+- Extend list of Prettier config files by ECMAScript module extentions
+
+## [10.4.0]
+
+- Fixed config resolution that caused plugins to be ignored when using Prettier 3.1.1 or later. (#3252)
+
+## [10.3.0]
+
+- Module path can be a dir when loading prettier version
+- Add language-override support for VSCode configuration.
+
+## [10.2.0]
+
+- Fixed the issue where VSCode was misrecognizing the path in output panel due to added quotes.
+- Fix module resolution with `prettierPath` setting
+
+## [10.1.0]
+
+Reverts back to prettier 2.x by default due to issues with extension
+
+## [10.0.0]
+
+Use Prettier 3.0 by default.
+Change default configuration for trailingComma to all to match Prettier 3.0.
+
+## [9.19.0]
+
+- Reverts change to `prettierPath` resolution. (#3045)
+
+## [9.18.0]
+
+- Support new config file types when using Prettier 3.0
+- Support for Prettier 3.0 plugin resolution
+
+## [9.17.0]
+
+- Fix plugins `parser` not inferred - Thanks to [@u3u](https://github.com/u3u)
+- Fix module resolution with `prettierPath` setting
+
+## [9.16.0]
+
+- Run only Prettier v3 in worker_threads. Run v2 in main thread.
+
+## [9.15.0]
+
+- Run Prettier in worker_threads for v3.
+
+## [9.14.0]
+
+- Fixes a bug in Remote SSH that had been occurring since VSCode 1.79.
+
+## [9.13.0]
+
+- Prettier 2.8.8
+
+## [9.12.1]
+
+- Fix typo in translations for zh-cn - Thanks to [@fisker](https://github.com/fisker)
+
+## [9.12.0]
+
+- Support Prettier v3. Not shipped by default, requires project install - Thanks to [@sosukesuzuki](https://github.com/sosukesuzuki)
+- Improved translations for zh-tw and zh-cn - Thanks to [@fisker](https://github.com/fisker) and [@Mrbunker](https://github.com/Mrbunker)
+
+## [9.11.0]
+
+- Prettier 2.8.7
+
+## [9.10.4]
+
+- Update description of vueIndentScriptAndStyle option
+
+## [9.10.3]
+
+- Prettier 2.8.0
+- Updated dependancies
+
 ## [9.9.0]
 
 - Use theme colors on status bar background for errors and warnings ([@zardoy](https://github.com/zardoy))

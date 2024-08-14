@@ -1,5 +1,6 @@
 import * as prettier from "prettier";
-import { TextDocument } from "vscode";
+import { TextDocument, Uri } from "vscode";
+import { PrettierInstance } from "./PrettierInstance";
 
 type PrettierSupportLanguage = {
   vscodeLanguageIds?: string[];
@@ -12,8 +13,10 @@ type PrettierFileInfoResult = {
 };
 type PrettierBuiltInParserName = string;
 type PrettierResolveConfigOptions = prettier.ResolveConfigOptions;
-type PrettierOptions = prettier.Options;
+type PrettierOptions = prettier.Options & { experimentalTernaries?: boolean };
 type PrettierFileInfoOptions = prettier.FileInfoOptions;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type PrettierPlugin = prettier.Plugin<any>;
 
 type PrettierModule = {
   format(source: string, options?: prettier.Options): string;
@@ -25,7 +28,9 @@ type PrettierModule = {
 };
 
 type ModuleResolverInterface = {
-  getPrettierInstance(fileName: string): Promise<PrettierModule | undefined>;
+  getPrettierInstance(
+    fileName: string
+  ): Promise<PrettierModule | PrettierInstance | undefined>;
   getResolvedIgnorePath(
     fileName: string,
     ignorePath: string
@@ -36,6 +41,18 @@ type ModuleResolverInterface = {
     vscodeConfig: PrettierVSCodeConfig
   ): Promise<"error" | "disabled" | PrettierOptions | null>;
   dispose(): void;
+  resolveConfig(
+    prettierInstance: {
+      resolveConfigFile(filePath?: string): Promise<string | null>;
+      resolveConfig(
+        fileName: string,
+        options?: prettier.ResolveConfigOptions
+      ): Promise<PrettierOptions | null>;
+    },
+    uri: Uri,
+    fileName: string,
+    vscodeConfig: PrettierVSCodeConfig
+  ): Promise<"error" | "disabled" | PrettierOptions | null>;
 };
 
 type TrailingCommaOption = "none" | "es5" | "all";
